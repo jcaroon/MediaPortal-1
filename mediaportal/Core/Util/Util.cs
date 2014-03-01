@@ -1294,7 +1294,7 @@ namespace MediaPortal.Util
       DriveInfo[] dis = DriveInfo.GetDrives();
       foreach (DriveInfo di in dis)
       {
-        if (di.DriveType == DriveType.Network && di.Name.ToLowerInvariant().StartsWith((strDrive).ToLowerInvariant()) &&
+        if (di.DriveType == DriveType.Network && strDrive.ToLowerInvariant().StartsWith(di.Name.ToLowerInvariant()) &&
             !string.IsNullOrEmpty(strDrive))
         {
           DirectoryInfo dir = di.RootDirectory;
