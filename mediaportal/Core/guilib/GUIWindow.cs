@@ -23,6 +23,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Reflection;
+using System.Threading;
 using System.Windows.Media.Animation;
 using System.Windows.Serialization;
 using System.Xml;
@@ -187,7 +188,7 @@ namespace MediaPortal.GUI.Library
       WINDOW_FULLSCREEN_TELETEXT = 7701,
       WINDOW_DIALOG_TEXT = 7900,
       WINDOW_TETRIS = 7776,
-      WINDOW_NUMBERPLACE = 7777, // rtv - sudoku clone
+      WINDOW_SUDOKU = 7777, // rtv - sudoku clone
       WINDOW_RADIO_LASTFM = 7890,
       WINDOW_MUSIC_MENU = 8888, // for harley
       WINDOW_SEARCH_RADIO = 8900 // gemx
@@ -487,13 +488,11 @@ namespace MediaPortal.GUI.Library
     {
 
       // add thread check to log calls not running in main thread/GUI
-      #if DEBUG
-      int iCurrentThread = System.Threading.Thread.CurrentThread.ManagedThreadId;
-      if (iCurrentThread != 1)
+      String threadName = Thread.CurrentThread.Name;
+      if (threadName != "MPMain" && threadName != "Config Main")
       {
-        Log.Error("LoadSkin: Running on thread <{0}> instead of main thread - StackTrace: '{1}'", iCurrentThread, Environment.StackTrace);
+        Log.Error("LoadSkin: Running on wrong thread - StackTrace: '{0}'", Environment.StackTrace);
       }
-      #endif
 
       _lastSkin = GUIGraphicsContext.Skin;
       // no filename is configured
