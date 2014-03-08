@@ -29,7 +29,7 @@ namespace MediaPortal.MusicPlayer.BASS
     private int _wasapiMixedChans = 0;
     private int _wasapiMixedFreq = 0;
 
-    private bool _disposed = false;
+    private bool _disposedMixerStream = false;
 
     private SYNCPROC _playbackEndProcDelegate = null;
     private int _syncProc = 0;
@@ -246,6 +246,14 @@ namespace MediaPortal.MusicPlayer.BASS
             wasApiExclusiveSupported = false; // And indicate that we need a new mixer
           }
 
+          // Handle the special case of a 5.0 file being played on a 5.1 or 6.1 device
+          if (outputChannels == 5)
+          {
+            Log.Info("BASS: Found a 5 channel file. Set upmixing with LFE set to silent");
+            _mixingMatrix = CreateFiveDotZeroUpMixMatrix();
+            wasApiExclusiveSupported = true;
+          }
+
           // If Exclusive mode is used, check, if that would be supported, otherwise init in shared mode
           if (Config.WasApiExclusiveMode)
           {
@@ -460,6 +468,8 @@ namespace MediaPortal.MusicPlayer.BASS
           return CreateStereoUpMixMatrix();
         case 4:
           return CreateQuadraphonicUpMixMatrix();
+        case 5:
+          return CreateFiveDotZeroUpMixMatrix(); // Special case to handle a 5.0 Music File
         case 6:
           return CreateFiveDotOneUpMixMatrix();
         default:
@@ -663,6 +673,42 @@ namespace MediaPortal.MusicPlayer.BASS
       return mixMatrix;
     }
 
+    private float[,] CreateFiveDotZeroUpMixMatrix()
+    {
+      float[,] mixMatrix = null;
+
+      // Handle the Special playback case of a 5.0 music file
+      switch (_bassPlayer.DeviceChannels)
+      {
+        case 6:
+           mixMatrix = new float[6, 5] {
+          	{1,0,0,0,0}, // left front out = left front in
+	          {0,1,0,0,0}, // right front out = right front in
+	          {0,0,1,0,0}, // centre out = centre in
+	          {0,0,0,0,0}, // LFE out = silent
+	          {0,0,0,1,0}, // left rear out = left rear in
+	          {0,0,0,0,1}  // right rear out = right rear in
+           }; 
+          Log.Info("BASS: Upmix 5.0-> 5.1 with LFE empty");
+          break;
+
+        case 7:
+          mixMatrix = new float[8, 5] {
+          	{1,0,0,0,0}, // left front out = left front in
+	          {0,1,0,0,0}, // right front out = right front in
+	          {0,0,1,0,0}, // centre out = centre in
+	          {0,0,0,0,0}, // LFE out = silent
+	          {0,0,0,1,0}, // left rear out = left rear in
+	          {0,0,0,0,1}, // right rear out = right rear in
+            {0,0,0,0,0}, // left back out = silent
+            {0,0,0,0,0}  // right back out = silent
+           };
+          Log.Info("BASS: Upmix 5.0-> 5.1 with LFE empty");
+          break;
+      }
+      return mixMatrix;
+    }
+
     private float[,] CreateFiveDotOneUpMixMatrix()
     {
       float[,] mixMatrix = null;
@@ -713,9 +759,14 @@ namespace MediaPortal.MusicPlayer.BASS
         // In order to have gapless playback, it needs to be invoked in sync.
         MusicStream nextStream = null;
         Playlists.PlayListItem nextSong = Playlists.PlayListPlayer.SingletonPlayer.GetNextItem();
-        if (nextSong != null)
+        MusicStream._fileType = Utils.GetFileType(musicstream.FilePath);
+        if (nextSong != null && MusicStream._fileType.FileMainType != FileMainType.WebStream)
         {
           nextStream = new MusicStream(nextSong.FileName, true);
+        }
+        else if (MusicStream._fileType.FileMainType == FileMainType.WebStream)
+        {
+          _bassPlayer.OnMusicStreamMessage(musicstream, MusicStream.StreamAction.InternetStreamChanged);
         }
 
         bool newMixerNeeded = false;
@@ -761,26 +812,29 @@ namespace MediaPortal.MusicPlayer.BASS
 
     public void Dispose()
     {
-      if (_disposed)
+      if (_disposedMixerStream)
       {
         return;
       }
 
-      _disposed = true;
-
-      Log.Debug("BASS: Disposing Mixer Stream");
-
-      try
+      lock (this)
       {
-        if (!Bass.BASS_StreamFree(_mixer))
+        _disposedMixerStream = true;
+
+        Log.Debug("BASS: Disposing Mixer Stream");
+
+        try
         {
-          Log.Error("BASS: Error freeing mixer: {0}", Bass.BASS_ErrorGetCode());
+          if (!Bass.BASS_StreamFree(_mixer))
+          {
+            Log.Error("BASS: Error freeing mixer: {0}", Bass.BASS_ErrorGetCode());
+          }
+          _mixer = 0;
         }
-        _mixer = 0;
-      }
-      catch (Exception ex)
-      {
-        Log.Error("BASS: Exception disposing mixer - {0}. {1}", ex.Message, ex.StackTrace);
+        catch (Exception ex)
+        {
+          Log.Error("BASS: Exception disposing mixer - {0}. {1}", ex.Message, ex.StackTrace);
+        }
       }
     }
 

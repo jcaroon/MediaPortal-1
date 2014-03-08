@@ -105,7 +105,7 @@ namespace MediaPortal.MusicPlayer.BASS
     private int VizFPS = 20;
 
     private int _DefaultCrossFadeIntervalMS = 4000;
-    private bool _initialized = false;
+    public static bool _initialized = false;
     private bool _bassFreed = false;
     private VisualizationWindow VizWindow = null;
     private VisualizationManager VizManager = null;
@@ -122,6 +122,8 @@ namespace MediaPortal.MusicPlayer.BASS
     private bool NotifyPlaying = true;
 
     private bool _isCDDAFile = false;
+    private bool _validAction;
+    private DateTime _lastAction = DateTime.Now;
     private int _speed = 1;
     private DateTime _seekUpdate = DateTime.Now;
 
@@ -581,20 +583,46 @@ namespace MediaPortal.MusicPlayer.BASS
 
         case Action.ActionType.ACTION_PAGE_UP:
           {
-            if (FullScreen)
+            var timeSpamVerif = DateTime.Now - _lastAction;
+            if (timeSpamVerif.TotalSeconds >= 2)
             {
-              Log.Debug("BASS: Switch to Previous Vis");
-              VizManager.GetPrevVis();
+              _validAction = true;
+            }
+            else
+            {
+              _validAction = false;
+            }
+            if (g_Player.IsMusic && g_Player.FullScreen)
+            {
+              if (_validAction)
+              {
+                _lastAction = DateTime.Now;
+                Log.Debug("BASS: Switch to Previous Vis");
+                VizManager.GetPrevVis();
+              }
             }
             break;
           }
 
         case Action.ActionType.ACTION_PAGE_DOWN:
           {
-            if (FullScreen)
+            var timeSpamVerif = DateTime.Now - _lastAction;
+            if (timeSpamVerif.TotalSeconds >= 2)
             {
-              Log.Info("BASS: Switch to Next Vis");
-              VizManager.GetNextVis();
+              _validAction = true;
+            }
+            else
+            {
+              _validAction = false;
+            }
+            if (g_Player.IsMusic && g_Player.FullScreen)
+            {
+              if (_validAction)
+              {
+                _lastAction = DateTime.Now;
+                Log.Info("BASS: Switch to Next Vis");
+                VizManager.GetNextVis();
+              }
             }
             break;
           }
@@ -633,10 +661,10 @@ namespace MediaPortal.MusicPlayer.BASS
           string nextSong = Playlists.PlayListPlayer.SingletonPlayer.GetNextSong();
           if (nextSong != string.Empty)
           {
+            g_Player.OnChanged(nextSong);
             PlayInternal(nextSong);
             g_Player.currentMedia = g_Player.MediaType.Music;
             g_Player.currentFilePlaying = nextSong;
-            g_Player.OnChanged(nextSong);
             g_Player.OnStarted();
           }
           else
@@ -1399,9 +1427,12 @@ namespace MediaPortal.MusicPlayer.BASS
       if (VizWindow.InvokeRequired)
       {
         ShowVisualizationWindowDelegate d = new ShowVisualizationWindowDelegate(ShowVisualizationWindow);
-        VizWindow.Invoke(d, new object[] { visible });
+        try
+        {
+          VizWindow.Invoke(d, new object[] { visible });
+        }
+        catch { }
       }
-
       else
       {
         VizWindow.Visible = visible;
@@ -1431,7 +1462,7 @@ namespace MediaPortal.MusicPlayer.BASS
     /// </summary>
     /// <param name="filePath"></param>
     /// <returns></returns>
-    private bool HandleCueFile(ref string filePath)
+    private bool HandleCueFile(ref string filePath, bool endOnly)
     {
       try
       {
@@ -1471,7 +1502,7 @@ namespace MediaPortal.MusicPlayer.BASS
                                  System.IO.Path.DirectorySeparatorChar + track.DataFile.Filename;
           if (audioFilePath.CompareTo(_filePath) == 0 /* && StreamIsPlaying(stream)*/)
           {
-            SetCueTrackEndPosition(GetCurrentStream());
+            SetCueTrackEndPosition(GetCurrentStream(), endOnly);
             return true;
           }
           filePath = audioFilePath;
@@ -1495,11 +1526,11 @@ namespace MediaPortal.MusicPlayer.BASS
     /// Sets the End Position for the CUE Track
     /// </summary>
     /// <param name="stream"></param>
-    private void SetCueTrackEndPosition(MusicStream stream)
+    private void SetCueTrackEndPosition(MusicStream stream, bool endOnly)
     {
       if (_currentCueSheet != null)
       {
-        stream.SetCueTrackEndPos(_cueTrackStartPos, _cueTrackEndPos);
+        stream.SetCueTrackEndPos(_cueTrackStartPos, _cueTrackEndPos, endOnly);
       }
     }
 
@@ -1525,7 +1556,7 @@ namespace MediaPortal.MusicPlayer.BASS
       }
 
       // Cue support
-      if (HandleCueFile(ref filePath))
+      if (HandleCueFile(ref filePath, true))
       {
         return true;
       }
@@ -1591,7 +1622,7 @@ namespace MediaPortal.MusicPlayer.BASS
       // Enable events, for various Playback Actions to be handled
       stream.MusicStreamMessage += new MusicStream.MusicStreamMessageHandler(OnMusicStreamMessage);
 
-      SetCueTrackEndPosition(stream);
+      SetCueTrackEndPosition(stream, false);
 
       // Plug in the stream into the Mixer
       if (!_mixer.AttachStream(stream))
@@ -1667,7 +1698,7 @@ namespace MediaPortal.MusicPlayer.BASS
           // Cue support
           if ((currentStream != null && currentStream.IsPlaying))
           {
-            if (HandleCueFile(ref filePath))
+            if (HandleCueFile(ref filePath, false))
             {
               return true;
             }
@@ -1880,6 +1911,9 @@ namespace MediaPortal.MusicPlayer.BASS
       // Execute the Stop in a separate thread, so that it doesn't block the Main UI Render thread
       new Thread(() =>
                    {
+                     // First deactivate Viz RenderThread, in HandleSongEnded, it's too late
+                     VizWindow.Run = false;
+
                      MusicStream stream = GetCurrentStream();
                      try
                      {
@@ -2017,7 +2051,6 @@ namespace MediaPortal.MusicPlayer.BASS
       }
 
       ShowVisualizationWindow(false);
-      VizWindow.Run = false;
 
       GUIGraphicsContext.IsPlaying = false;
 

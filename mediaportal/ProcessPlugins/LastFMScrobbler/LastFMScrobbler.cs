@@ -83,6 +83,10 @@ namespace MediaPortal.ProcessPlugins.LastFMScrobbler
       g_Player.PlayBackEnded += OnPlayBackEnded;
       g_Player.PlayBackChanged += OnPlayBackChanged;
       g_Player.PlayBackStopped += OnPlayBackStopped;
+      var mdb = MusicDatabase.Instance;
+      var sessionKey = mdb.GetLastFMSK();
+      var currentUser = mdb.GetLastFMUser();
+      var a = new LastFMLibrary(sessionKey, currentUser); //TODO this is just making _SK get loaded.   No need to actual instansiate
     }
 
     public void Stop()
@@ -131,7 +135,7 @@ namespace MediaPortal.ProcessPlugins.LastFMScrobbler
     /// <returns>true if this plugin is enabled by default, otherwise false.</returns>
     public bool DefaultEnabled()
     {
-      return true;
+      return false;
     }
 
     /// <summary>
@@ -410,8 +414,8 @@ namespace MediaPortal.ProcessPlugins.LastFMScrobbler
       { // last.fm say not to scrobble songs that last less than 30 seconds
         return;
       }
-      if (stoptime < 240 && stoptime < (tag.Duration / 2))
-      { // last.fm say only to scrobble is more than 4 minutes has been listned to or 
+      if (stoptime < 120 && stoptime < (tag.Duration / 2))
+      { // last.fm say only to scrobble is more than 2 minutes has been listned to or 
         // at least hald the duration of the song
         return;
       }
