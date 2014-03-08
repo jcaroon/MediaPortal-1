@@ -520,8 +520,9 @@ namespace MediaPortal.Util
         if (strDir != "cdda:")
           try
           {
-            bool available = Util.Utils.CheckServerStatus(strDir);
-            if (available)
+            // TODO (Fix slow issue if hostname is not linked to IP address in system32/drivers/host file
+            //bool available = Util.Utils.CheckServerStatus(strDir);
+            //if (available)
             {
               strRoot = Path.GetFullPath(strDir);
             }
