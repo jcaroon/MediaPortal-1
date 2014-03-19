@@ -56,6 +56,7 @@ using Microsoft.DirectX;
 using Microsoft.DirectX.Direct3D;
 using Microsoft.Win32;
 using Action = MediaPortal.GUI.Library.Action;
+using System.Collections.Generic;
 
 #endregion
 
@@ -94,6 +95,8 @@ public class MediaPortalApp : D3D, IRender
   private bool                  _startWithBasicHome;
   private bool                  _useOnlyOneHome;
   private bool                  _suspended;
+  private bool                  _onSuspended;
+  private bool                  _resumed;
   private bool                  _ignoreContextMenuAction;
   private bool                  _supportsFiltering;
   private bool                  _supportsAlphaBlend;
@@ -193,6 +196,11 @@ public class MediaPortalApp : D3D, IRender
   #pragma warning restore 169
 
   private ShellNotifications Notifications = new ShellNotifications();
+
+  private static List<Message> _listThreadMessages = new List<Message>();
+  private static readonly object _listThreadMessagesLock = new object();
+  private static event ThreadMessageHandler OnThreadMessageHandler;
+  private delegate void ThreadMessageHandler(object sender, Message message);
 
   #endregion
 
@@ -1371,7 +1379,44 @@ public class MediaPortalApp : D3D, IRender
     }
     return a;
   }
-  
+
+  private void DispatchThreadMessages()
+  {
+    if (_listThreadMessages.Count > 0)
+    {
+      List<Message> list;
+      lock (_listThreadMessagesLock) // need lock when switching queues
+      {
+        list = _listThreadMessages;
+        _listThreadMessages = new List<Message>();
+      }
+      for (int i = 0; i < list.Count; ++i)
+      {
+        Message message = list[i];
+        OnPowerBroadcast(ref message);
+      }
+    }
+  }
+
+  /// <summary>
+  /// send thread message. Same as sendmessage() however message is placed on a queue
+  /// which is processed later.
+  /// </summary>
+  /// <param name="message">new message to send</param>
+  private static void SendThreadMessage(ref Message message)
+  {
+    if (OnThreadMessageHandler != null)
+    {
+      OnThreadMessageHandler(null, message);
+    }
+    if (message != null)
+    {
+      lock (_listThreadMessagesLock)
+      {
+        _listThreadMessages.Add(message);
+      }
+    }
+  }
 
   /// <summary>
   /// Message Pump
@@ -1625,93 +1670,123 @@ public class MediaPortalApp : D3D, IRender
   /// <param name="msg"></param>
   private void OnPowerBroadcast(ref Message msg)
   {
-    Log.Debug("Main: WM_POWERBROADCAST ({0})", Enum.GetName(typeof(PBT_EVENT), msg.WParam.ToInt32()));
-    switch (msg.WParam.ToInt32())
+    try
     {
-      case PBT_APMSUSPEND:
-        Log.Info("Main: Suspending operation");
-        PrepareSuspend();
-        PluginManager.WndProc(ref msg);
-        OnSuspend();
-        break;
+      Log.Debug("Main: WM_POWERBROADCAST ({0})", Enum.GetName(typeof (PBT_EVENT), msg.WParam.ToInt32()));
+      switch (msg.WParam.ToInt32())
+      {
+        case PBT_APMSUSPEND:
+          Log.Info("Main: Suspending operation");
+          _onSuspended = true;
+          PrepareSuspend();
+          PluginManager.WndProc(ref msg);
+          OnSuspend();
+          break;
 
-      // When resuming from hibernation, the OS always assume that a user is present. This is by design of Windows.
-      case PBT_APMRESUMEAUTOMATIC:
-        Log.Info("Main: Resuming operation");
-        OnResumeAutomatic();
-        PluginManager.WndProc(ref msg);
-        break;
-
-      // only for Windows XP
-      case PBT_APMRESUMECRITICAL:
-        Log.Info("Main: Resuming operation after a forced suspend");
-        OnResumeAutomatic();
-        OnResumeSuspend();
-        PluginManager.WndProc(ref msg);
-        break;
-
-      case PBT_APMRESUMESUSPEND:
-        OnResumeSuspend();
-        PluginManager.WndProc(ref msg);
-        break;
-
-      case PBT_POWERSETTINGCHANGE:
-        var ps = (POWERBROADCAST_SETTING)Marshal.PtrToStructure(msg.LParam, typeof(POWERBROADCAST_SETTING));
-
-        if (ps.PowerSetting == GUID_SYSTEM_AWAYMODE && ps.DataLength == Marshal.SizeOf(typeof(Int32)))
-        {
-          switch (ps.Data)
+          // When resuming from hibernation, the OS always assume that a user is present. This is by design of Windows.
+        case PBT_APMRESUMEAUTOMATIC:
+          Log.Info("Main: Resuming operation");
+          if (_onSuspended)
           {
-            case 0:
-              Log.Info("Main: The computer is exiting away mode");
-              IsInAwayMode = false;
-              break;
-            case 1:
-              Log.Info("Main: The computer is entering away mode");
-              IsInAwayMode = true;
-              break;
+            SendThreadMessage(ref msg);
           }
-        }
-        // GUID_SESSION_DISPLAY_STATUS is only provided on Win8 and above
-        else if ((ps.PowerSetting == GUID_MONITOR_POWER_ON || ps.PowerSetting == GUID_SESSION_DISPLAY_STATUS) && ps.DataLength == Marshal.SizeOf(typeof(Int32)))
-        {
-          switch (ps.Data)
+          else
           {
-            case 0:
-              Log.Info("Main: The display is off");
-              IsDisplayTurnedOn = false;
-              break;
-            case 1:
-              Log.Info("Main: The display is on");
-              IsDisplayTurnedOn = true;
-              ShowMouseCursor(false);
-              break;
-            case 2:
-              Log.Info("Main: The display is dimmed");
-              IsDisplayTurnedOn = true;
-              break;
+            OnResumeSuspend();
           }
-        }
-        // GUIT_SESSION_USER_PRESENCE is only provide on Win8 and above
-        else if (ps.PowerSetting == GUID_SESSION_USER_PRESENCE && ps.DataLength == Marshal.SizeOf(typeof(Int32)))
-        {
-          switch (ps.Data)
+          PluginManager.WndProc(ref msg);
+          break;
+
+          // only for Windows XP
+        case PBT_APMRESUMECRITICAL:
+          Log.Info("Main: Resuming operation after a forced suspend");
+          if (_onSuspended)
           {
-            case 0:
-              Log.Info("Main: User is providing input to the session");
-              IsUserPresent = true;
-              ShowMouseCursor(false);
-              break;
-            case 2:
-              Log.Info("Main: The user activity timeout has elapsed with no interaction from the user");
-              IsUserPresent = false;
-              break;
+            SendThreadMessage(ref msg);
           }
-        }
-        PluginManager.WndProc(ref msg);
-        break;
+          else
+          {
+            OnResumeSuspend();
+          }
+          PluginManager.WndProc(ref msg);
+          break;
+
+        case PBT_APMRESUMESUSPEND:
+          Log.Info("Main: Resuming operation after a suspend");
+          if (_onSuspended)
+          {
+            SendThreadMessage(ref msg);
+          }
+          else
+          {
+            OnResumeSuspend();
+          }
+          PluginManager.WndProc(ref msg);
+          break;
+
+        case PBT_POWERSETTINGCHANGE:
+          var ps = (POWERBROADCAST_SETTING) Marshal.PtrToStructure(msg.LParam, typeof (POWERBROADCAST_SETTING));
+
+          if (ps.PowerSetting == GUID_SYSTEM_AWAYMODE && ps.DataLength == Marshal.SizeOf(typeof (Int32)))
+          {
+            switch (ps.Data)
+            {
+              case 0:
+                Log.Info("Main: The computer is exiting away mode");
+                IsInAwayMode = false;
+                break;
+              case 1:
+                Log.Info("Main: The computer is entering away mode");
+                IsInAwayMode = true;
+                break;
+            }
+          }
+            // GUID_SESSION_DISPLAY_STATUS is only provided on Win8 and above
+          else if ((ps.PowerSetting == GUID_MONITOR_POWER_ON || ps.PowerSetting == GUID_SESSION_DISPLAY_STATUS) &&
+                   ps.DataLength == Marshal.SizeOf(typeof (Int32)))
+          {
+            switch (ps.Data)
+            {
+              case 0:
+                Log.Info("Main: The display is off");
+                IsDisplayTurnedOn = false;
+                break;
+              case 1:
+                Log.Info("Main: The display is on");
+                IsDisplayTurnedOn = true;
+                ShowMouseCursor(false);
+                break;
+              case 2:
+                Log.Info("Main: The display is dimmed");
+                IsDisplayTurnedOn = true;
+                break;
+            }
+          }
+            // GUIT_SESSION_USER_PRESENCE is only provide on Win8 and above
+          else if (ps.PowerSetting == GUID_SESSION_USER_PRESENCE && ps.DataLength == Marshal.SizeOf(typeof (Int32)))
+          {
+            switch (ps.Data)
+            {
+              case 0:
+                Log.Info("Main: User is providing input to the session");
+                IsUserPresent = true;
+                ShowMouseCursor(false);
+                break;
+              case 2:
+                Log.Info("Main: The user activity timeout has elapsed with no interaction from the user");
+                IsUserPresent = false;
+                break;
+            }
+          }
+          PluginManager.WndProc(ref msg);
+          break;
+      }
+      msg.Result = (IntPtr) 1;
     }
-    msg.Result = (IntPtr)1;
+    catch (System.Exception ex)
+    {
+      Log.Error("Main: Exception catch on OnPowerBroadcast : {0}", ex);
+    }
   }
 
 
@@ -2322,41 +2397,56 @@ public class MediaPortalApp : D3D, IRender
   /// </summary>
   private void OnSuspend()
   {
-    // stop playback
-    Log.Debug("Main: OnSuspend - stopping playback");
-    if (GUIGraphicsContext.IsPlaying)
+    if (_suspended)
     {
-      Currentmodulefullscreen();
-      g_Player.Stop();
-      while (GUIGraphicsContext.IsPlaying)
+      Log.Info("Main: OnSuspend is already in progress");
+      _onSuspended = false;
+      return;
+    }
+    try
+    {
+      // stop playback
+      Log.Debug("Main: OnSuspend - stopping playback");
+      if (GUIGraphicsContext.IsPlaying)
       {
-        // This could lead into OS putting system into sleep before MP completes OnSuspend().
-        // OS gives only 2 seconds time to application to react power events (>= Vista)
-        Thread.Sleep(100);
+        Currentmodulefullscreen();
+        g_Player.Stop();
+        while (GUIGraphicsContext.IsPlaying)
+        {
+          // This could lead into OS putting system into sleep before MP completes OnSuspend().
+          // OS gives only 2 seconds time to application to react power events (>= Vista)
+          Thread.Sleep(100);
+        }
       }
+      SaveLastActiveModule();
+
+      Log.Debug("Main: OnSuspend - stopping input devices");
+      InputDevices.Stop();
+
+      Log.Debug("Main: OnSuspend - stopping AutoPlay");
+      AutoPlay.StopListening();
+
+      // un-mute volume in case we are suspending in away mode
+      if (IsInAwayMode && VolumeHandler.Instance.IsMuted)
+      {
+        Log.Debug("Main: OnSuspend - unmute volume");
+        VolumeHandler.Instance.UnMute();
+      }
+      VolumeHandler.Dispose();
+
+      // we only dispose the DB connection if the DB path is remote.      
+      Log.Debug("Main: OnSuspend - dispose DB connection");
+      DisposeDBs();
+
+      _suspended = true;
+      Log.Info("Main: OnSuspend - Done");
     }
-    SaveLastActiveModule();
-
-    Log.Debug("Main: OnSuspend - stopping input devices");
-    InputDevices.Stop();
-
-    Log.Debug("Main: OnSuspend - stopping AutoPlay");
-    AutoPlay.StopListening();
-      
-    // un-mute volume in case we are suspending in away mode
-    if (IsInAwayMode && VolumeHandler.Instance.IsMuted)
+    finally
     {
-      Log.Debug("Main: OnSuspend - unmute volume");
-      VolumeHandler.Instance.UnMute();
+      _resumed = false;
+      _onSuspended = false;
+      DispatchThreadMessages();
     }
-    VolumeHandler.Dispose();
-
-    // we only dispose the DB connection if the DB path is remote.      
-    Log.Debug("Main: OnSuspend - dispose DB connection");
-    DisposeDBs();
-
-    _suspended = true;
-    Log.Info("Main: OnSuspend - Done");
   }
 
   /// <summary>
@@ -2386,6 +2476,15 @@ public class MediaPortalApp : D3D, IRender
   /// </summary>
   private void OnResumeSuspend()
   {
+    if (_resumed)
+    {
+      Log.Info("Main: OnResumeSuspend Resuming is already in progress");
+      return;
+    }
+
+    // Reopen DB and activation Startup delay if user use it.
+    OnResumeAutomatic();
+
     // avoid screen saver after standby
     GUIGraphicsContext.ResetLastActivity();
     _ignoreContextMenuAction = false;
@@ -2423,6 +2522,7 @@ public class MediaPortalApp : D3D, IRender
     }
 
     _suspended = false;
+    _resumed = true;
     _lastOnresume = DateTime.Now;
     Log.Info("Main: OnResumeSuspend - Done");
   }
