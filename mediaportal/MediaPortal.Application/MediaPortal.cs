@@ -21,6 +21,7 @@
 #region usings
 
 using System;
+using System.Collections.Concurrent;
 using System.Configuration;
 using System.Diagnostics;
 using System.Drawing;
@@ -49,14 +50,13 @@ using MediaPortal.Properties;
 using MediaPortal.RedEyeIR;
 using MediaPortal.Ripper;
 using MediaPortal.SerialIR;
-using MediaPortal.Util;
 using MediaPortal.Services;
+using MediaPortal.Util;
 using MediaPortal.Visualization;
 using Microsoft.DirectX;
 using Microsoft.DirectX.Direct3D;
 using Microsoft.Win32;
 using Action = MediaPortal.GUI.Library.Action;
-using System.Collections.Generic;
 
 #endregion
 
@@ -95,8 +95,6 @@ public class MediaPortalApp : D3D, IRender
   private bool                  _startWithBasicHome;
   private bool                  _useOnlyOneHome;
   private bool                  _suspended;
-  private bool                  _onSuspended;
-  private bool                  _resumed;
   private bool                  _ignoreContextMenuAction;
   private bool                  _supportsFiltering;
   private bool                  _supportsAlphaBlend;
@@ -124,6 +122,9 @@ public class MediaPortalApp : D3D, IRender
   private MouseEventArgs        _lastMouseClickEvent;
   private readonly Rectangle[]  _region;
   private static RestartOptions _restartOptions;
+  private EventWaitHandle       _delayResumeHandle;
+  private Thread                _powerBroadcastThread;
+  private BlockingCollection<Message> _powerBroadcastQueue;
   private IntPtr                _deviceNotificationHandle;
   private IntPtr                _displayStatusHandle;
   private IntPtr                _userPresenceHandle;
@@ -196,11 +197,6 @@ public class MediaPortalApp : D3D, IRender
   #pragma warning restore 169
 
   private ShellNotifications Notifications = new ShellNotifications();
-
-  private static List<Message> _listThreadMessages = new List<Message>();
-  private static readonly object _listThreadMessagesLock = new object();
-  private static event ThreadMessageHandler OnThreadMessageHandler;
-  private delegate void ThreadMessageHandler(object sender, Message message);
 
   #endregion
 
@@ -1379,44 +1375,7 @@ public class MediaPortalApp : D3D, IRender
     }
     return a;
   }
-
-  private void DispatchThreadMessages()
-  {
-    if (_listThreadMessages.Count > 0)
-    {
-      List<Message> list;
-      lock (_listThreadMessagesLock) // need lock when switching queues
-      {
-        list = _listThreadMessages;
-        _listThreadMessages = new List<Message>();
-      }
-      for (int i = 0; i < list.Count; ++i)
-      {
-        Message message = list[i];
-        OnPowerBroadcast(ref message);
-      }
-    }
-  }
-
-  /// <summary>
-  /// send thread message. Same as sendmessage() however message is placed on a queue
-  /// which is processed later.
-  /// </summary>
-  /// <param name="message">new message to send</param>
-  private static void SendThreadMessage(ref Message message)
-  {
-    if (OnThreadMessageHandler != null)
-    {
-      OnThreadMessageHandler(null, message);
-    }
-    if (message != null)
-    {
-      lock (_listThreadMessagesLock)
-      {
-        _listThreadMessages.Add(message);
-      }
-    }
-  }
+  
 
   /// <summary>
   /// Message Pump
@@ -1465,7 +1424,22 @@ public class MediaPortalApp : D3D, IRender
 
         // power management
         case WM_POWERBROADCAST:
-          OnPowerBroadcast(ref msg);
+          int msgType = msg.WParam.ToInt32();
+          Log.Debug("Main: WM_POWERBROADCAST ({0})", Enum.GetName(typeof(PBT_EVENT), msgType));
+          if (msgType == PBT_APMSUSPEND || msgType == PBT_APMRESUMECRITICAL)
+          {
+            // clear all msgs from queue
+            Log.Debug("Main: clear message queue");
+            foreach (Message item in _powerBroadcastQueue.GetConsumingEnumerable()) { }
+            Log.Debug("Main: cancel delay");
+            // _delayResumeHandle.Set();
+            Log.Debug("Main: delay cancelled");
+          }          
+          // append msg to queue
+          Log.Debug("Main: add message to queue");
+          _delayResumeHandle.Reset();
+          _powerBroadcastQueue.Add(Message.Create(msg.HWnd, msg.Msg, msg.WParam, msg.LParam));
+          msg.Result = (IntPtr)1;
           break;
 
         // set maximum and minimum form size in windowed mode
@@ -1663,117 +1637,113 @@ public class MediaPortalApp : D3D, IRender
     return result;
   }
 
-
-  /// <summary>
-  /// 
-  /// </summary>
-  /// <param name="msg"></param>
-  private void OnPowerBroadcast(ref Message msg)
+  private void PowerBroadcastThread()
   {
-    try
+    int lastMsgType = 0;
+    int msgType;
+    Message msg;
+
+    while (true)
     {
-      Log.Debug("Main: WM_POWERBROADCAST ({0})", Enum.GetName(typeof (PBT_EVENT), msg.WParam.ToInt32()));
-      switch (msg.WParam.ToInt32())
+      // get next msg from queue, blocks if there is no msg
+      msg = _powerBroadcastQueue.Take();
+      msgType = msg.WParam.ToInt32();
+      Log.Debug("PowerBroadcastThread: WM_POWERBROADCAST ({0})", Enum.GetName(typeof(PBT_EVENT), msgType));
+
+      switch (msgType)
       {
         case PBT_APMSUSPEND:
-          Log.Info("Main: Suspending operation");
-          _onSuspended = true;
+          Log.Info("PowerBroadcastThread: Suspending operation");
+          lastMsgType = msgType;
           PrepareSuspend();
           PluginManager.WndProc(ref msg);
           OnSuspend();
           break;
 
-          // When resuming from hibernation, the OS always assume that a user is present. This is by design of Windows.
         case PBT_APMRESUMEAUTOMATIC:
-          Log.Info("Main: Resuming operation");
-          if (_onSuspended)
+          Log.Info("PowerBroadcastThread: Resuming operation");
+          if (lastMsgType != PBT_APMRESUMESUSPEND)
           {
-            SendThreadMessage(ref msg);
+            if (DelayResume())
+              break;  // delay was cancelled
           }
-          else
-          {
-            OnResumeSuspend();
-          }
+          lastMsgType = msgType;
+          OnResumeAutomatic();
           PluginManager.WndProc(ref msg);
           break;
 
-          // only for Windows XP
         case PBT_APMRESUMECRITICAL:
-          Log.Info("Main: Resuming operation after a forced suspend");
-          if (_onSuspended)
-          {
-            SendThreadMessage(ref msg);
-          }
-          else
-          {
-            OnResumeSuspend();
-          }
+          Log.Info("PowerBroadcastThread: Resuming operation after a forced suspend");
+          if (DelayResume())
+            break;  // delay was cancelled
+          lastMsgType = msgType;
+          OnResumeAutomatic();
+          OnResumeSuspend();
           PluginManager.WndProc(ref msg);
           break;
 
         case PBT_APMRESUMESUSPEND:
-          Log.Info("Main: Resuming operation after a suspend");
-          if (_onSuspended)
+          Log.Info("PowerBroadcastThread: Resuming operation on user action");
+          if (lastMsgType != PBT_APMRESUMEAUTOMATIC)
           {
-            SendThreadMessage(ref msg);
+            if (DelayResume())
+              break;  // delay was cancelled
           }
-          else
-          {
-            OnResumeSuspend();
-          }
+          lastMsgType = msgType;
+          OnResumeSuspend();
           PluginManager.WndProc(ref msg);
           break;
 
         case PBT_POWERSETTINGCHANGE:
-          var ps = (POWERBROADCAST_SETTING) Marshal.PtrToStructure(msg.LParam, typeof (POWERBROADCAST_SETTING));
+          lastMsgType = msgType;
+          var ps = (POWERBROADCAST_SETTING)Marshal.PtrToStructure(msg.LParam, typeof(POWERBROADCAST_SETTING));
 
-          if (ps.PowerSetting == GUID_SYSTEM_AWAYMODE && ps.DataLength == Marshal.SizeOf(typeof (Int32)))
+          if (ps.PowerSetting == GUID_SYSTEM_AWAYMODE && ps.DataLength == Marshal.SizeOf(typeof(Int32)))
           {
             switch (ps.Data)
             {
               case 0:
-                Log.Info("Main: The computer is exiting away mode");
+                Log.Info("PowerBroadcastThread: The computer is exiting away mode");
                 IsInAwayMode = false;
                 break;
               case 1:
-                Log.Info("Main: The computer is entering away mode");
+                Log.Info("PowerBroadcastThread: The computer is entering away mode");
                 IsInAwayMode = true;
                 break;
             }
           }
-            // GUID_SESSION_DISPLAY_STATUS is only provided on Win8 and above
-          else if ((ps.PowerSetting == GUID_MONITOR_POWER_ON || ps.PowerSetting == GUID_SESSION_DISPLAY_STATUS) &&
-                   ps.DataLength == Marshal.SizeOf(typeof (Int32)))
+          // GUID_SESSION_DISPLAY_STATUS is only provided on Win8 and above
+          else if ((ps.PowerSetting == GUID_MONITOR_POWER_ON || ps.PowerSetting == GUID_SESSION_DISPLAY_STATUS) && ps.DataLength == Marshal.SizeOf(typeof(Int32)))
           {
             switch (ps.Data)
             {
               case 0:
-                Log.Info("Main: The display is off");
+                Log.Info("PowerBroadcastThread: The display is off");
                 IsDisplayTurnedOn = false;
                 break;
               case 1:
-                Log.Info("Main: The display is on");
+                Log.Info("PowerBroadcastThread: The display is on");
                 IsDisplayTurnedOn = true;
                 ShowMouseCursor(false);
                 break;
               case 2:
-                Log.Info("Main: The display is dimmed");
+                Log.Info("PowerBroadcastThread: The display is dimmed");
                 IsDisplayTurnedOn = true;
                 break;
             }
           }
-            // GUIT_SESSION_USER_PRESENCE is only provide on Win8 and above
-          else if (ps.PowerSetting == GUID_SESSION_USER_PRESENCE && ps.DataLength == Marshal.SizeOf(typeof (Int32)))
+          // GUIT_SESSION_USER_PRESENCE is only provide on Win8 and above
+          else if (ps.PowerSetting == GUID_SESSION_USER_PRESENCE && ps.DataLength == Marshal.SizeOf(typeof(Int32)))
           {
             switch (ps.Data)
             {
               case 0:
-                Log.Info("Main: User is providing input to the session");
+                Log.Info("PowerBroadcastThread: User is providing input to the session");
                 IsUserPresent = true;
                 ShowMouseCursor(false);
                 break;
               case 2:
-                Log.Info("Main: The user activity timeout has elapsed with no interaction from the user");
+                Log.Info("PowerBroadcastThread: The user activity timeout has elapsed with no interaction from the user");
                 IsUserPresent = false;
                 break;
             }
@@ -1781,14 +1751,27 @@ public class MediaPortalApp : D3D, IRender
           PluginManager.WndProc(ref msg);
           break;
       }
-      msg.Result = (IntPtr) 1;
-    }
-    catch (System.Exception ex)
-    {
-      Log.Error("Main: Exception catch on OnPowerBroadcast : {0}", ex);
     }
   }
 
+  /// <summary>
+  /// DelayResume() waits as configured
+  /// </summary>
+  /// <returns>true if the waiting was cancelled</returns>
+  private bool DelayResume()
+  {
+    // delay resuming as configured
+    using (Settings xmlreader = new MPSettings())
+    {
+      int waitOnResume = xmlreader.GetValueAsBool("general", "delay resume", false) ? xmlreader.GetValueAsInt("general", "delay", 0) : 0;
+      if (waitOnResume > 0)
+      {
+        Log.Info("PowerBroadcastThread: Waiting on resume {0} secs", waitOnResume);
+        return _delayResumeHandle.WaitOne(waitOnResume * 1000);
+      }
+      return false;
+    }
+  }
 
   /// <summary>
   /// 
@@ -2397,56 +2380,41 @@ public class MediaPortalApp : D3D, IRender
   /// </summary>
   private void OnSuspend()
   {
-    if (_suspended)
+    // stop playback
+    Log.Debug("Main: OnSuspend - stopping playback");
+    if (GUIGraphicsContext.IsPlaying)
     {
-      Log.Info("Main: OnSuspend is already in progress");
-      _onSuspended = false;
-      return;
-    }
-    try
-    {
-      // stop playback
-      Log.Debug("Main: OnSuspend - stopping playback");
-      if (GUIGraphicsContext.IsPlaying)
+      Currentmodulefullscreen();
+      g_Player.Stop();
+      while (GUIGraphicsContext.IsPlaying)
       {
-        Currentmodulefullscreen();
-        g_Player.Stop();
-        while (GUIGraphicsContext.IsPlaying)
-        {
-          // This could lead into OS putting system into sleep before MP completes OnSuspend().
-          // OS gives only 2 seconds time to application to react power events (>= Vista)
-          Thread.Sleep(100);
-        }
+        // This could lead into OS putting system into sleep before MP completes OnSuspend().
+        // OS gives only 2 seconds time to application to react power events (>= Vista)
+        Thread.Sleep(100);
       }
-      SaveLastActiveModule();
-
-      Log.Debug("Main: OnSuspend - stopping input devices");
-      InputDevices.Stop();
-
-      Log.Debug("Main: OnSuspend - stopping AutoPlay");
-      AutoPlay.StopListening();
-
-      // un-mute volume in case we are suspending in away mode
-      if (IsInAwayMode && VolumeHandler.Instance.IsMuted)
-      {
-        Log.Debug("Main: OnSuspend - unmute volume");
-        VolumeHandler.Instance.UnMute();
-      }
-      VolumeHandler.Dispose();
-
-      // we only dispose the DB connection if the DB path is remote.      
-      Log.Debug("Main: OnSuspend - dispose DB connection");
-      DisposeDBs();
-
-      _suspended = true;
-      Log.Info("Main: OnSuspend - Done");
     }
-    finally
+    SaveLastActiveModule();
+
+    Log.Debug("Main: OnSuspend - stopping input devices");
+    InputDevices.Stop();
+
+    Log.Debug("Main: OnSuspend - stopping AutoPlay");
+    AutoPlay.StopListening();
+      
+    // un-mute volume in case we are suspending in away mode
+    if (IsInAwayMode && VolumeHandler.Instance.IsMuted)
     {
-      _resumed = false;
-      _onSuspended = false;
-      DispatchThreadMessages();
+      Log.Debug("Main: OnSuspend - unmute volume");
+      VolumeHandler.Instance.UnMute();
     }
+    VolumeHandler.Dispose();
+
+    // we only dispose the DB connection if the DB path is remote.      
+    Log.Debug("Main: OnSuspend - dispose DB connection");
+    DisposeDBs();
+
+    _suspended = true;
+    Log.Info("Main: OnSuspend - Done");
   }
 
   /// <summary>
@@ -2454,17 +2422,6 @@ public class MediaPortalApp : D3D, IRender
   /// </summary>
   private void OnResumeAutomatic()
   {
-    // delay resuming as configured
-    using (Settings xmlreader = new MPSettings())
-    {
-      int waitOnResume = xmlreader.GetValueAsBool("general", "delay resume", false) ? xmlreader.GetValueAsInt("general", "delay", 0) : 0;
-      if (waitOnResume > 0)
-      {
-        Log.Info("Main: OnResumeAutomatic - waiting on resume {0} secs", waitOnResume);
-        Thread.Sleep(waitOnResume * 1000);
-      }
-    }
-
     Log.Debug("Main: OnResumeAutomatic - reopen Database");
     ReOpenDBs();
 
@@ -2476,15 +2433,6 @@ public class MediaPortalApp : D3D, IRender
   /// </summary>
   private void OnResumeSuspend()
   {
-    if (_resumed)
-    {
-      Log.Info("Main: OnResumeSuspend Resuming is already in progress");
-      return;
-    }
-
-    // Reopen DB and activation Startup delay if user use it.
-    OnResumeAutomatic();
-
     // avoid screen saver after standby
     GUIGraphicsContext.ResetLastActivity();
     _ignoreContextMenuAction = false;
@@ -2522,7 +2470,6 @@ public class MediaPortalApp : D3D, IRender
     }
 
     _suspended = false;
-    _resumed = true;
     _lastOnresume = DateTime.Now;
     Log.Info("Main: OnResumeSuspend - Done");
   }
@@ -2656,6 +2603,19 @@ public class MediaPortalApp : D3D, IRender
     #pragma warning disable 168
     VolumeHandler vh = VolumeHandler.Instance;
     #pragma warning restore 168
+
+    // setup powerbroadcast message queue
+    _powerBroadcastQueue = new BlockingCollection<Message>();
+
+    // setup delay wait handle
+    _delayResumeHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
+
+    // start thread for power message handling
+    _powerBroadcastThread = new Thread(PowerBroadcastThread);
+    _powerBroadcastThread.Name = "PowerBroadcast Thread";
+    _powerBroadcastThread.IsBackground = true;
+    _powerBroadcastThread.Start();
+    Log.Debug("Main: PowerBroadcast Thread started");
 
     // register for device change notifications
     RegisterForDeviceNotifications();

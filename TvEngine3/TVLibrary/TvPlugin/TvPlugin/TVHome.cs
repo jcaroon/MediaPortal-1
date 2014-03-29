@@ -116,12 +116,10 @@ namespace TvPlugin
     private static bool _preferAudioTypeOverLang = false;
     private static bool _autoFullScreen = false;
     private static bool _suspended = false;
-    private static bool _onSuspended = false;
-    private static bool _resumed = false;
     private static bool _showlastactivemodule = false;
     private static bool _showlastactivemoduleFullscreen = false;
     private static bool _playbackStopped = false;
-    private static bool _onPageLoadDone = false;
+    public static bool _onPageLoadDone = false;
     private static bool _userChannelChanged = false;
     private static bool _showChannelStateIcons = true;
     private static bool _doingHandleServerNotConnected = false;
@@ -131,7 +129,7 @@ namespace TvPlugin
     private static bool _connected = false;
     private static bool _isAnyCardRecording = false;
     protected static TvServer _server;
-    internal static bool firstNotLoaded = true;
+    public static bool firstNotLoaded = true;
 
     private static ManualResetEvent _waitForBlackScreen = null;
     private static ManualResetEvent _waitForVideoReceived = null;
@@ -157,9 +155,6 @@ namespace TvPlugin
     protected GUIButtonControl btnActiveStreams = null;
     [SkinControl(14)]
     protected GUIButtonControl btnActiveRecordings = null;
-
-    private static List<Message> _listThreadMessages = new List<Message>();
-    private static readonly object _listThreadMessagesLock = new object();
 
     // error handling
     public class ChannelErrorInfo
@@ -196,14 +191,12 @@ namespace TvPlugin
 
     private static event OnChannelChangedDelegate OnChannelChanged;
     private delegate void OnChannelChangedDelegate();
-    private static event ThreadMessageHandler OnThreadMessageHandler;
 
     #endregion
 
     #region delegates
 
     private delegate void StopPlayerMainThreadDelegate();
-    private delegate void ThreadMessageHandler(object sender, Message message);
 
     #endregion
 
@@ -1577,44 +1570,6 @@ namespace TvPlugin
       }
     }
 
-    private void DispatchThreadMessages()
-    {
-      if (_listThreadMessages.Count > 0)
-      {
-        List<Message> list;
-        lock (_listThreadMessagesLock) // need lock when switching queues
-        {
-          list = _listThreadMessages;
-          _listThreadMessages = new List<Message>();
-        }
-        for (int i = 0; i < list.Count; ++i)
-        {
-          Message message = list[i];
-          WndProc(ref message);
-        }
-      }
-    }
-
-    /// <summary>
-    /// send thread message. Same as sendmessage() however message is placed on a queue
-    /// which is processed later.
-    /// </summary>
-    /// <param name="message">new message to send</param>
-    private static void SendThreadMessage(ref Message message)
-    {
-      if (OnThreadMessageHandler != null)
-      {
-        OnThreadMessageHandler(null, message);
-      }
-      if (message != null)
-      {
-        lock (_listThreadMessagesLock)
-        {
-          _listThreadMessages.Add(message);
-        }
-      }
-    }
-
     #endregion
 
     public static void OnSelectGroup()
@@ -1691,14 +1646,7 @@ namespace TvPlugin
 
     private void OnSuspend()
     {
-      Log.Info("TVHome.OnSuspend()");
-      // OnSuspend already in progress
-      if (_suspended)
-      {
-        Log.Info("TVHome: Suspend is already in progress");
-        _onSuspended = false;
-        return;
-      }
+      Log.Debug("TVHome.OnSuspend()");
 
       RemoteControl.OnRemotingDisconnected -=
         new RemoteControl.RemotingDisconnectedDelegate(RemoteControl_OnRemotingDisconnected);
@@ -1721,20 +1669,12 @@ namespace TvPlugin
       {
         _ServerNotConnectedHandled = false;
         _suspended = true;
-        _onSuspended = false;
-        _resumed = false;
-        DispatchThreadMessages();
       }
     }
 
     private void OnResume()
     {
-      Log.Info("TVHome.OnResume()");
-      if (_resumed)
-      {
-        Log.Info("TVHome: Resuming is already in progress");
-        return;
-      }
+      Log.Debug("TVHome.OnResume()");
       try
       {
         Connected = false;
@@ -1755,7 +1695,6 @@ namespace TvPlugin
       finally
       {
         _suspended = false;
-        _resumed = true;
       }
     }
 
@@ -1777,39 +1716,24 @@ namespace TvPlugin
         {
           case PBT_APMSTANDBY:
             Log.Info("TVHome.WndProc(): Windows is going to standby");
-            _onSuspended = true;
             OnSuspend();
             break;
           case PBT_APMSUSPEND:
             Log.Info("TVHome.WndProc(): Windows is suspending");
-            _onSuspended = true;
             OnSuspend();
             break;
           case PBT_APMQUERYSUSPEND:
           case PBT_APMQUERYSTANDBY:
             Log.Info("TVHome.WndProc(): Windows is going into powerstate (hibernation/standby)");
+
             break;
           case PBT_APMRESUMESUSPEND:
             Log.Info("TVHome.WndProc(): Windows has resumed from hibernate mode");
-            if (_onSuspended)
-            {
-              SendThreadMessage(ref msg);
-            }
-            else
-            {
-              OnResume();
-            }
+            OnResume();
             break;
           case PBT_APMRESUMESTANDBY:
             Log.Info("TVHome.WndProc(): Windows has resumed from standby mode");
-            if (_onSuspended)
-            {
-              SendThreadMessage(ref msg);
-            }
-            else
-            {
-              OnResume();
-            }
+            OnResume();
             break;
         }
       }
@@ -3494,8 +3418,7 @@ namespace TvPlugin
           // ensure right channel name, even if not watchable:Navigator.Channel = channel; 
           ChannelTuneFailedNotifyUser(succeeded, _status.IsSet(LiveTvStatus.WasPlaying), channel);
 
-          // keep fullscreen false by setting _doingChannelChange to 'true' only when autoTurnOnTv is false
-          _doingChannelChange = !_autoTurnOnTv;
+          _doingChannelChange = true; // keep fullscreen false;
           return true; // "success"
         }
 
