@@ -21,7 +21,7 @@
 #region usings
 
 using System;
-using System.Collections.Concurrent;
+using System.Collections;
 using System.Configuration;
 using System.Diagnostics;
 using System.Drawing;
@@ -123,8 +123,10 @@ public class MediaPortalApp : D3D, IRender
   private readonly Rectangle[]  _region;
   private static RestartOptions _restartOptions;
   private EventWaitHandle       _delayResumeHandle;
+  private EventWaitHandle       _queueHandle;
   private Thread                _powerBroadcastThread;
-  private BlockingCollection<Message> _powerBroadcastQueue;
+  private Queue                 _queue;
+  private Queue                 _powerBroadcastQueue;
   private IntPtr                _deviceNotificationHandle;
   private IntPtr                _displayStatusHandle;
   private IntPtr                _userPresenceHandle;
@@ -1430,15 +1432,14 @@ public class MediaPortalApp : D3D, IRender
           {
             // clear all msgs from queue
             Log.Debug("Main: clear message queue");
-            foreach (Message item in _powerBroadcastQueue.GetConsumingEnumerable()) { }
+            _powerBroadcastQueue.Clear();
             Log.Debug("Main: cancel delay");
-            // _delayResumeHandle.Set();
-            Log.Debug("Main: delay cancelled");
+            _delayResumeHandle.Set();
           }          
           // append msg to queue
           Log.Debug("Main: add message to queue");
-          _delayResumeHandle.Reset();
-          _powerBroadcastQueue.Add(Message.Create(msg.HWnd, msg.Msg, msg.WParam, msg.LParam));
+          _powerBroadcastQueue.Enqueue(Message.Create(msg.HWnd, msg.Msg, msg.WParam, msg.LParam));
+          _queueHandle.Set();
           msg.Result = (IntPtr)1;
           break;
 
@@ -1646,9 +1647,16 @@ public class MediaPortalApp : D3D, IRender
     while (true)
     {
       // get next msg from queue, blocks if there is no msg
-      msg = _powerBroadcastQueue.Take();
+      Log.Debug("PowerBroadcastThread: get next message from queue");
+      if (_powerBroadcastQueue.Count == 0)
+      {
+        Log.Debug("PowerBroadcastThread: no message in queue - waiting");
+        _queueHandle.Reset();
+        _queueHandle.WaitOne();
+      }
+      msg = (Message)_powerBroadcastQueue.Dequeue();
       msgType = msg.WParam.ToInt32();
-      Log.Debug("PowerBroadcastThread: WM_POWERBROADCAST ({0})", Enum.GetName(typeof(PBT_EVENT), msgType));
+      Log.Debug("PowerBroadcastThread: got WM_POWERBROADCAST ({0}) message from queue", Enum.GetName(typeof(PBT_EVENT), msgType));
 
       switch (msgType)
       {
@@ -1760,17 +1768,21 @@ public class MediaPortalApp : D3D, IRender
   /// <returns>true if the waiting was cancelled</returns>
   private bool DelayResume()
   {
+    bool result = false;
+    
     // delay resuming as configured
     using (Settings xmlreader = new MPSettings())
     {
       int waitOnResume = xmlreader.GetValueAsBool("general", "delay resume", false) ? xmlreader.GetValueAsInt("general", "delay", 0) : 0;
       if (waitOnResume > 0)
       {
-        Log.Info("PowerBroadcastThread: Waiting on resume {0} secs", waitOnResume);
-        return _delayResumeHandle.WaitOne(waitOnResume * 1000);
+        Log.Debug("PowerBroadcastThread: Waiting on resume {0} secs", waitOnResume);
+        _delayResumeHandle.Reset();
+        result = _delayResumeHandle.WaitOne(waitOnResume * 1000);
+        Log.Debug("PowerBroadcastThread: Waiting on resume terminated by {0}", result ? "cancel" : "time elapsed");
       }
-      return false;
     }
+    return result;
   }
 
   /// <summary>
@@ -2605,10 +2617,12 @@ public class MediaPortalApp : D3D, IRender
     #pragma warning restore 168
 
     // setup powerbroadcast message queue
-    _powerBroadcastQueue = new BlockingCollection<Message>();
+    _queue = new Queue();
+    _powerBroadcastQueue = Queue.Synchronized(_queue);
 
-    // setup delay wait handle
-    _delayResumeHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
+    // setup wait handles
+    _delayResumeHandle = new EventWaitHandle(false, EventResetMode.ManualReset);
+    _queueHandle = new EventWaitHandle(false, EventResetMode.ManualReset);
 
     // start thread for power message handling
     _powerBroadcastThread = new Thread(PowerBroadcastThread);
